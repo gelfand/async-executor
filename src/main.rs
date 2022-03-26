@@ -1,12 +1,11 @@
 #![feature(async_closure)]
 #![allow(dead_code)]
-mod spin_lock;
 mod timer_future;
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, task::ArcWake, FutureExt, StreamExt};
 use lockfree::channel::mpmc::{self, Receiver, RecvErr, Sender};
-use spin_lock::SpinLock;
-use std::cell::UnsafeCell;
+use std::pin::Pin;
+use std::sync::atomic::AtomicPtr;
 use std::{future::Future, task::Context};
 use std::{sync::Arc, time::Duration};
 use timer_future::TimerFuture;
@@ -20,9 +19,10 @@ struct Spawner {
     task_sender: Sender<Arc<Task>>,
 }
 
+pub type F<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 struct Task {
-    fut: UnsafeCell<Option<BoxFuture<'static, ()>>>,
-    pause: SpinLock,
+    fut: AtomicPtr<Option<BoxFuture<'static, ()>>>,
     task_sender: Sender<Arc<Task>>,
 }
 
@@ -48,13 +48,12 @@ impl Spawner {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let fut = Some(future.boxed());
+        let fut = Box::into_raw(Box::new(Some(future.boxed())));
         let task = Arc::new(Task {
-            fut: UnsafeCell::new(fut),
-            pause: SpinLock::new(),
+            fut: AtomicPtr::new(fut),
             task_sender: self.task_sender.clone(),
         });
-        self.task_sender.send(task).expect("too many tasks queued");
+        self.task_sender.send(task).unwrap();
     }
 }
 
@@ -62,40 +61,47 @@ impl ArcWake for Task {
     #[inline(always)]
     fn wake_by_ref(arc_self: &Arc<Self>) {
         let cloned = arc_self.clone();
-        arc_self
-            .task_sender
-            .send(cloned)
-            .expect("too many tasks queued");
+        arc_self.task_sender.send(cloned).unwrap();
     }
 }
 
 impl Executor {
     #[inline(always)]
     fn run(&self) {
-        loop {
-            match self.ready_queue.recv() {
-                Ok(task) => {
-                    // Take the future, and if it has not yet completed (is still Some),
-                    // poll it in an attempt to complete it.
-                    task.pause.lock();
-                    if let Some(fut) = unsafe { &mut *task.fut.get() } {
-                        let waker = futures::task::waker_ref(&task);
-                        let cx = &mut Context::from_waker(&*waker);
+        let threads = num_cpus::get();
 
-                        if fut.as_mut().poll(cx).is_ready() {
-                            // The future has completed, so we can drop it.
-                            unsafe {
-                                *task.fut.get() = None;
+        let handles = (0..threads).map(|_| {
+            let ready_queue = self.ready_queue.clone();
+            std::thread::spawn(move || loop {
+                match ready_queue.recv() {
+                    Ok(task) => {
+                        // Take the future, and if it has not yet completed (is still Some),
+                        // poll it in an attempt to complete it.
+                        let fut =
+                            unsafe { &mut *task.fut.load(std::sync::atomic::Ordering::Acquire) };
+                        if let Some(mut fut) = fut.take() {
+                            let waker = futures::task::waker_ref(&task);
+                            let cx = &mut Context::from_waker(&*waker);
+
+                            if fut.as_mut().poll(cx).is_pending() {
+                                // If the future is still pending, put it back in the queue.
+                                task.fut.store(
+                                    Box::into_raw(Box::new(Some(fut))),
+                                    std::sync::atomic::Ordering::Release,
+                                );
                             }
                         }
                     }
-                    task.pause.unlock();
+                    Err(err) => match err {
+                        RecvErr::NoMessage => continue,
+                        RecvErr::NoSender => break,
+                    },
                 }
-                Err(err) => match err {
-                    RecvErr::NoMessage => continue,
-                    RecvErr::NoSender => break,
-                },
-            }
+            })
+        });
+
+        for handle in handles {
+            handle.join().expect("thread panicked");
         }
     }
 }
@@ -126,4 +132,37 @@ fn main() {
 
     // Run the executor until it is done.
     executor.run();
+}
+
+#[cfg(test)]
+#[allow(unused_imports)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_executor() {
+        let (executor, spawner) = new_executor_and_spawner();
+        spawner.spawn(async {
+            println!("howdy!");
+            TimerFuture::new(Duration::new(2, 0)).await;
+            println!("done!");
+        });
+
+        drop(spawner);
+        executor.run();
+    }
+
+    #[test]
+    fn test_futs_unordered() {
+        let (executor, spawner) = new_executor_and_spawner();
+        spawner.spawn(async {
+            (0..1 << 20)
+                .map(|_| say_hello())
+                .collect::<FuturesUnordered<_>>()
+                .for_each(async move |_| {})
+                .await;
+        });
+
+        drop(spawner);
+        executor.run();
+    }
 }
